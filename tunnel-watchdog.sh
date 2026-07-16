@@ -20,17 +20,34 @@ kill_tunnel() {
   pkill -9 -f ".vscode/cli/servers" 2>/dev/null
 }
 
+# Markers the CLI itself prints when a post-update respawn wedges: it defers to
+# a stuck existing singleton instead of taking over. `tunnel status` still
+# reports the name in this state (registration survives the wedge), so the
+# status probe alone misses it — we must scan the log too.
+WEDGE_MARKERS='respawn requested|Command-line options will not be applied|Connected to an existing tunnel process'
+
 healthy() {
-  # `tunnel status` talks to the running singleton. When the process is
-  # wedged post-update, this hangs (caught by timeout) or reports no tunnel.
+  # 1) Status probe: catches the two failure modes `status` *can* see —
+  #    hanging (caught by timeout) and reporting no tunnel.
   local out
   out="$(timeout 15 "$CODE" tunnel status 2>/dev/null)" || return 1
-  grep -q '"name"' <<< "$out"
+  grep -q '"name"' <<< "$out" || return 1
+
+  # 2) Wedge-marker probe: catches the wedge `status` can't see, where the
+  #    tunnel still reports its name but can't attach a server. Only inspect
+  #    output written since this launch, so a healed wedge from a prior cycle
+  #    doesn't trigger a spurious restart.
+  local since
+  since="$(tail -c +$((LAUNCH_OFFSET + 1)) "$LOG" 2>/dev/null)"
+  grep -Eq "$WEDGE_MARKERS" <<< "$since" && return 1
+
+  return 0
 }
 
 while true; do
   kill_tunnel
   log "starting tunnel '$TUNNEL_NAME'"
+  LAUNCH_OFFSET="$(wc -c < "$LOG" 2>/dev/null || echo 0)"  # scan only this launch's log output
   "$CODE" tunnel --accept-server-license-terms --name "$TUNNEL_NAME" >> "$LOG" 2>&1 &
   pid=$!
   sleep "$STARTUP_GRACE"
